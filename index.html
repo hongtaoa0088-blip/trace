@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>TrustAnchor v4.0 - 自动化网状溯源系统</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; background: #f4f7f9; color: #333; }
+        .app-container { display: flex; flex-direction: column; height: 100vh; }
+        
+        /* 顶部导航 */
+        .toolbar { background: #1a1a2e; color: white; padding: 15px 25px; display: flex; gap: 20px; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.2); }
+        .toolbar input { padding: 10px; border-radius: 4px; border: none; width: 400px; font-family: monospace; }
+        .toolbar button { padding: 10px 25px; background: #4ecca3; border: none; border-radius: 4px; color: #1a1a2e; font-weight: bold; cursor: pointer; transition: 0.3s; }
+        .toolbar button:hover { background: #45b791; transform: translateY(-1px); }
+        
+        /* 主视图 */
+        .viewport { flex: 1; position: relative; background: #ffffff; }
+        #network { width: 100%; height: 100%; }
+        
+        /* 状态与日志 */
+        .status-bar { position: absolute; bottom: 20px; left: 20px; background: rgba(26, 26, 46, 0.9); color: #fff; padding: 10px 20px; border-radius: 30px; font-size: 13px; pointer-events: none; }
+        .loading-spin { display: inline-block; width: 10px; height: 10px; border: 2px solid #4ecca3; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 8px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        /* 右侧详情面板 */
+        .side-panel { width: 300px; border-left: 1px solid #ddd; background: #fff; padding: 20px; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="app-container">
+    <div class="toolbar">
+        <div style="font-size: 1.2em; font-weight: bold;">TrustAnchor <span style="color:#4ecca3">v4.0</span></div>
+        <input type="text" id="targetAddr" placeholder="输入 TRC20 目标地址 (T开头)" value="">
+        <button onclick="startAutoTrace()">一键全自动溯源</button>
+        <div id="loadingInfo" style="display:none;"><span class="loading-spin"></span>正在深度扫描关联关系...</div>
+    </div>
+
+    <div class="viewport">
+        <div id="network"></div>
+        <div class="status-bar" id="statusBar">就绪。请输入地址开始。</div>
+    </div>
+</div>
+
+<script>
+    const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8qmtHU8bo8Ybu4wUsvb';
+    let nodes = new vis.DataSet();
+    let edges = new vis.DataSet();
+    let network = null;
+    let visited = new Set();
+
+    // 解决跨域与连接问题的代理请求函数
+    async function smartFetch(url) {
+        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+        const res = await fetch(proxyUrl);
+        if (!res.ok) throw new Error("API连接失败");
+        return await res.json();
+    }
+
+    // 初始化可视化引擎
+    function initEngine() {
+        const container = document.getElementById('network');
+        const options = {
+            nodes: { shape: 'dot', size: 20, font: { size: 12, face: 'monospace' }, borderWidth: 2 },
+            edges: { arrows: 'to', color: { color: '#bdc3c7', highlight: '#4ecca3' }, font: { size: 10, align: 'top' } },
+            layout: { 
+                hierarchical: { 
+                    enabled: true, 
+                    direction: 'DU', // 从下往上排列，资金来源在顶部
+                    sortMethod: 'directed',
+                    levelSeparation: 150
+                } 
+            },
+            physics: { enabled: false } // 层级布局通常不需要开启物理模拟
+        };
+        network = new vis.Network(container, { nodes, edges }, options);
+        
+        // 点击节点手动继续展开
+        network.on("click", (p) => {
+            if (p.nodes.length) fetchUpstream(p.nodes[0]);
+        });
+    }
+
+    // 核心溯源逻辑
+    async function fetchUpstream(addr, currentLevel = 0) {
+        if (visited.has(addr) || currentLevel > 2) return;
+        visited.add(addr);
+        
+        updateStatus(`正在分析层级 ${currentLevel}: ${addr.slice(0,8)}...`);
+        
+        try {
+            const url = `https://apilist.tronscan.org/api/token_trc20/transfers?limit=50&start=0&sort=-timestamp&contract_address=${USDT_CONTRACT}&address=${addr}`;
+            const data = await smartFetch(url);
+            const transfers = data.token_transfers || [];
+
+            // 1. 权重汇总
+            let sources = {};
+            transfers.forEach(t => {
+                if (t.to === addr && t.from !== addr) {
+                    sources[t.from] = (sources[t.from] || 0) + (t.amount / 1e6);
+                }
+            });
+
+            // 2. 取前 5 个最相关的关联节点（模仿查哈希，减少视觉噪音）
+            const topNodes = Object.entries(sources).sort((a,b) => b[1]-a[1]).slice(0, 5);
+
+            for (const [from, amount] of topNodes) {
+                // 添加节点
+                if (!nodes.get(from)) {
+                    nodes.add({
+                        id: from,
+                        label: from.slice(0,6) + '...',
+                        title: `地址: ${from}\n关联金额: ${amount} U`,
+                        color: amount > 5000 ? '#9b59b6' : '#3498db',
+                        font: { color: '#333' }
+                    });
+                }
+                
+                // 添加连线
+                const edgeId = `e_${from}_${addr}`;
+                if (!edges.get(edgeId)) {
+                    edges.add({ id: edgeId, from: from, to: addr, label: Math.round(amount) + ' U' });
+                }
+
+                // 自动化递归：如果是大额关联，自动查下一层
+                if (currentLevel < 1) {
+                    await new Promise(r => setTimeout(r, 500)); // 避开 API 频率限制
+                    await fetchUpstream(from, currentLevel + 1);
+                }
+            }
+        } catch (e) {
+            console.error(e);
+            updateStatus("部分节点获取受限，请稍后点击节点重试");
+        }
+    }
+
+    async function startAutoTrace() {
+        const startAddr = document.getElementById('targetAddr').value.trim();
+        if (!startAddr) return alert("请输入地址");
+
+        // 重置状态
+        nodes.clear(); edges.clear(); visited.clear();
+        document.getElementById('loadingInfo').style.display = 'inline-block';
+        
+        // 添加目标起始点
+        nodes.add({ id: startAddr, label: 'TARGET\n'+startAddr.slice(-4), color: '#e74c3c', size: 30, font: { color: 'white', bold: true } });
+        
+        if (!network) initEngine();
+        
+        await fetchUpstream(startAddr, 0);
+        
+        document.getElementById('loadingInfo').style.display = 'none';
+        updateStatus("全自动溯源完成。可点击蓝色节点继续深挖。");
+    }
+
+    function updateStatus(msg) {
+        document.getElementById('statusBar').innerText = msg;
+    }
+</script>
+</body>
+</html>
